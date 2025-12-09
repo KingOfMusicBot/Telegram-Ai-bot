@@ -1,0 +1,46 @@
+{
+  "name": "Telegram-AI-Bot",
+  "description": "A Telegram AI bot powered by Groq (llama-3.1-8b-instant)",
+  "repository": "https://github.com/yourusername/yourrepo",
+  "keywords": ["telegram", "bot", "python", "groq", "ai"],
+  "env": {
+    "TELEGRAM_BOT_TOKEN": {
+      "description": "Your Telegram Bot Token",
+      "required": true
+    },
+    "OPENAI_API_KEY": {
+      "description": "Groq API Key",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram Numeric ID",
+      "required": true
+    },
+    "CHANNEL_URL": {
+      "description": "Optional channel link",
+      "required": false
+    },
+    "SUPPORT_URL": {
+      "description": "Optional support link",
+      "required": false
+    },
+    "START_PIC_URL": {
+      "description": "Optional start image URL",
+      "required": false
+    },
+    "COOLDOWN_SECONDS": {
+      "description": "Cooldown per user",
+      "value": "5",
+      "required": false
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "buildpacks": [
+    { "url": "heroku/python" }
+  ]
+}
