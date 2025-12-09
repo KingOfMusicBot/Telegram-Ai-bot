@@ -1,45 +1,57 @@
 {
   "name": "Telegram-AI-Bot",
-  "description": "A Telegram AI bot powered by Groq (llama-3.1-8b-instant)",
+  "description": "Telegram AI Study Bot (Groq + MongoDB + PTB21). Fully Heroku deployable.",
   "repository": "https://github.com/yourusername/yourrepo",
-  "keywords": ["telegram", "bot", "python", "groq", "ai"],
+  "keywords": ["telegram", "ai", "groq", "python", "bot", "mongodb"],
+  
   "env": {
     "TELEGRAM_BOT_TOKEN": {
-      "description": "Your Telegram Bot Token",
+      "description": "Your Telegram Bot Token (from @BotFather)",
       "required": true
     },
     "OPENAI_API_KEY": {
-      "description": "Groq API Key",
+      "description": "Your Groq API Key (gsk_xxx)",
       "required": true
     },
     "OWNER_ID": {
-      "description": "Your Telegram Numeric ID",
+      "description": "Your numeric Telegram ID (Used for /stats , /broadcast)",
       "required": true
     },
+    "MONGO_URI": {
+      "description": "MongoDB connection string (Atlas recommended)",
+      "required": true
+    },
+    "MONGO_DB": {
+      "description": "Database name to store users & groups",
+      "value": "telegram_bot",
+      "required": false
+    },
     "CHANNEL_URL": {
-      "description": "Optional channel link",
+      "description": "Optional: Channel link",
       "required": false
     },
     "SUPPORT_URL": {
-      "description": "Optional support link",
+      "description": "Optional: Support link",
       "required": false
     },
     "START_PIC_URL": {
-      "description": "Optional start image URL",
+      "description": "Optional: Start image URL",
       "required": false
     },
     "COOLDOWN_SECONDS": {
-      "description": "Cooldown per user",
+      "description": "Anti-spam delay per user",
       "value": "5",
       "required": false
     }
   },
+
   "formation": {
     "worker": {
       "quantity": 1,
       "size": "basic"
     }
   },
+
   "buildpacks": [
     { "url": "heroku/python" }
   ]
