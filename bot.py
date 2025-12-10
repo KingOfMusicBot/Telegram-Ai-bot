@@ -180,7 +180,16 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tools_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    text = "🛠 AI Tools:\n/notes /explain /mcq /summary /solve /quiz /currentaffairs"
+    text = (
+        "🛠 AI Tools Available:\n\n"
+        "• /notes <topic>\n"
+        "• /explain <topic>\n"
+        "• /mcq <topic>\n"
+        "• /summary <text ya replied msg>\n"
+        "• /solve <question>\n"
+        "• /quiz <topic>\n"
+        "• /currentaffairs\n"
+    )
     await q.message.reply_text(text)
 
 async def quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
