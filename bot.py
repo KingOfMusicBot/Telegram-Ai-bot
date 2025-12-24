@@ -1,229 +1,430 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
-from pymongo import MongoClient
-from werkzeug.security import generate_password_hash, check_password_hash
-from dotenv import load_dotenv
+# bot.py — FULL restored, MongoDB + Groq + Heroku-safe (event-loop fix)
+import logging
 import os
-import datetime
-from bson.objectid import ObjectId
-from groq import Groq  # <-- NEW LIBRARY
+import asyncio
+from time import time
+from datetime import datetime
+from signal import SIGTERM, SIGINT
 
-# Environment Variables Load
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from openai import OpenAI
+import motor.motor_asyncio
+
+# ----------------- CONFIG -----------------
 load_dotenv()
-
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "super_secret_key")
-
-# --- CONFIGURATION ---
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Groq key
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "telegram_bot")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "")
+SUPPORT_URL = os.getenv("SUPPORT_URL", "")
+START_PIC_URL = os.getenv("START_PIC_URL", "")
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "5"))
 
-# --- 1. Database Connection ---
-try:
-    client = MongoClient(MONGO_URI)
-    db = client.ai_agency
-    print("✅ MongoDB Connected Successfully!")
-except Exception as e:
-    print(f"❌ Database Error: {e}")
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN missing")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY (Groq) missing")
+if not MONGO_URI:
+    raise ValueError("MONGO_URI missing")
 
-# --- 2. Groq AI Setup ---
-try:
-    # Groq Client Initialize
-    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    print("✅ Groq AI Connected!")
-except Exception as e:
-    print(f"❌ Groq Connection Error: {e}")
+# ----------------- LOGGING -----------------
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- ROUTES ---
+# ----------------- GROQ CLIENT -----------------
+client = OpenAI(api_key=OPENAI_API_KEY, base_url="https://api.groq.com/openai/v1")
 
-@app.route('/')
-def home():
-    user = session.get('user')
-    reviews = list(db.reviews.find().sort("date", -1).limit(6))
-    projects = list(db.projects.find().sort("date", -1))
-    return render_template('index.html', user=user, reviews=reviews, projects=projects)
+# ----------------- MONGO CLIENT (global) -----------------
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client[MONGO_DB]
 
-@app.route('/tools')
-def tools_page():
-    user = session.get('user')
-    return render_template('tools.html', user=user)
+# ----------------- UTILITIES -----------------
+def check_spam(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> float:
+    now_ts = time()
+    rate_limits = context.application.bot_data.setdefault("rate_limits", {})
+    last = rate_limits.get(user_id, 0)
+    diff = now_ts - last
+    if diff < COOLDOWN_SECONDS:
+        return COOLDOWN_SECONDS - diff
+    rate_limits[user_id] = now_ts
+    return 0.0
 
-# --- GROQ TOOL: YOUTUBE ---
-@app.route('/api/youtube-gen', methods=['POST'])
-def youtube_gen():
-    topic = request.form.get('topic')
-    
-    prompt = f"""
-    Act as a YouTube Expert. I am making a video about '{topic}'.
-    1. Generate 5 Viral Clickbait Titles (Catchy & SEO friendly).
-    2. Generate 15 Comma-separated High Ranking Tags.
-    
-    Format the output strictly like this:
-    Titles:
-    - Title 1
-    - Title 2...
-    
-    Tags:
-    tag1, tag2, tag3...
-    """
-    
+async def ask_ai(prompt: str, mode: str = "default") -> str:
+    system_map = {
+        "notes": "You are a teacher. Produce concise, bulleted notes for students.",
+        "explain": "You are a friendly teacher. Explain the concept in simple Hinglish with examples.",
+        "mcq": "Generate 5 MCQs for the topic. Provide options A-D and an Answer Key at the end.",
+        "summary": "Summarize the text into concise bullet points for students.",
+        "solve": "Solve the math/logic problem step-by-step and show final answer.",
+        "quiz": "Create a 5-question quiz (mix of MCQ/short). Provide answer key.",
+        "current": "Create practice-style current affairs Q&A for students.",
+        "default": "You are a helpful AI assistant that answers clearly in Hinglish.",
+    }
+    system = system_map.get(mode, system_map["default"])
     try:
-        # Groq Request (Using Llama 3 Model)
-        completion = groq_client.chat.completions.create(
-            model="llama3-8b-8192",  # Bahut Fast Model hai
+        resp = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": "You are a helpful AI assistant."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
+            max_tokens=800,
         )
-        
-        ai_text = completion.choices[0].message.content
-        
-        # Text Processing
-        parts = ai_text.split("Tags:")
-        raw_titles = parts[0].replace("Titles:", "").strip().split("\n")
-        titles = [t.strip("- ").strip() for t in raw_titles if t.strip()]
-        tags = parts[1].strip() if len(parts) > 1 else "No tags generated."
-        
-        return render_template('tool_result.html', result_type="youtube", titles=titles, tags=tags)
-        
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"<h3 style='color:red'>Groq Error: {e}</h3>"
+        logger.exception("Groq API error")
+        return "AI side pe error aa gaya. Thodi der baad try karo."
 
-# --- GROQ TOOL: INSTAGRAM ---
-@app.route('/api/insta-gen', methods=['POST'])
-def insta_gen():
-    desc = request.form.get('desc')
-    
-    prompt = f"""
-    Act as a Social Media Manager. I have a photo with this description: '{desc}'.
-    1. Write 5 Engaging Captions (mix of funny, inspiring, short).
-    2. Generate 20 Trending Hashtags.
-    
-    Format output strictly like this:
-    Captions:
-    - Caption 1
-    - Caption 2...
-    
-    Hashtags:
-    #tag1 #tag2...
+# ----------------- DB helpers -----------------
+async def register_chat(chat_id: int, chat_type: str, context: ContextTypes.DEFAULT_TYPE, user_obj=None):
     """
-    
+    Upsert user or group into MongoDB so data persists across restarts.
+    """
+    now = datetime.utcnow()
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=[
-                {"role": "system", "content": "You are a creative social media expert."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-        )
-        
-        ai_text = completion.choices[0].message.content
-        
-        parts = ai_text.split("Hashtags:")
-        raw_captions = parts[0].replace("Captions:", "").strip().split("\n")
-        captions = [c.strip("- ").strip() for c in raw_captions if c.strip()]
-        hashtags = parts[1].strip() if len(parts) > 1 else "#NoHashtags"
-        
-        return render_template('tool_result.html', result_type="instagram", captions=captions, hashtags=hashtags)
-
-    except Exception as e:
-        return f"<h3 style='color:red'>Groq Error: {e}</h3>"
-
-# --- AUTH & OTHER ROUTES (Same as before) ---
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        name = request.form.get('name')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        if db.users.find_one({"email": email}):
-            flash("Email already registered!")
-            return redirect(url_for('login'))
-        hashed_password = generate_password_hash(password)
-        db.users.insert_one({"name": name, "email": email, "password": hashed_password, "role": "user", "created_at": datetime.datetime.now()})
-        session['user'] = {"name": name, "email": email, "role": "user"}
-        return redirect(url_for('dashboard'))
-    return render_template('signup.html')
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        user = db.users.find_one({"email": email})
-        if user and check_password_hash(user['password'], password):
-            session['user'] = {"name": user['name'], "email": user['email'], "role": user.get('role', 'user')}
-            return redirect(url_for('dashboard'))
+        if chat_type == "private":
+            await db.users.update_one(
+                {"user_id": int(chat_id)},
+                {"$set": {"last_seen": now, "username": getattr(user_obj, "username", None)},
+                 "$setOnInsert": {"first_seen": now}},
+                upsert=True,
+            )
         else:
-            flash("❌ Wrong Email or Password")
-            return redirect(url_for('login'))
-    return render_template('login.html')
+            await db.groups.update_one(
+                {"chat_id": int(chat_id)},
+                {"$set": {"last_seen": now, "type": chat_type},
+                 "$setOnInsert": {"first_seen": now}},
+                upsert=True,
+            )
+    except Exception as e:
+        logger.warning("DB register failed: %s", e)
+        # fallback: keep in-memory sets
+        data = context.application.bot_data
+        if chat_type == "private":
+            data.setdefault("users", set()).add(chat_id)
+        else:
+            data.setdefault("groups", set()).add(chat_id)
 
-@app.route('/logout')
-def logout():
-    session.pop('user', None)
-    return redirect(url_for('home'))
+async def create_indexes(app):
+    """Optional: create indexes on startup in background."""
+    try:
+        await db.users.create_index("user_id", unique=True)
+        await db.groups.create_index("chat_id", unique=True)
+        logger.info("MongoDB indexes ensured")
+    except Exception as e:
+        logger.warning("Index creation failed: %s", e)
 
-@app.route('/dashboard')
-def dashboard():
-    if 'user' not in session: return redirect(url_for('login'))
-    is_admin = (session['user']['email'] == ADMIN_EMAIL)
-    return render_template('dashboard.html', user=session['user'], is_admin=is_admin)
+# ----------------- HELP TEXT & UI -----------------
+def get_help_text() -> str:
+    return (
+        "≋ Help & Commands ≋\n\n"
+        "Private: direct question bhejo.\n"
+        "Group: mention the bot (@BotUsername) or reply to bot's message.\n\n"
+        "Study Commands:\n"
+        "/notes <topic>\n"
+        "/explain <topic>\n"
+        "/mcq <topic>\n"
+        "/summary <text or reply>\n"
+        "/solve <question>\n"
+        "/quiz <topic>\n"
+        "/currentaffairs\n\n"
+        "Owner only: /stats /broadcast"
+    )
 
-@app.route('/submit-query', methods=['POST'])
-def submit_query():
-    if 'user' not in session: return redirect(url_for('login'))
-    data = request.form
-    db.queries.insert_one({
-        "user_email": session['user']['email'], "user_name": session['user']['name'],
-        "service_type": data.get('service'), "message": data.get('message'),
-        "status": "Pending", "date": datetime.datetime.now()
-    })
-    flash("✅ Query Sent!")
-    return redirect(url_for('dashboard'))
+# ----------------- COMMAND HANDLERS -----------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    welcome = (
+        "Hey! 👋\nMain AI Study Bot hoon. Doubts poochho, notes lo, MCQs, summaries aur quizzes.\n"
+        "Private me direct bhejo. Group me mention ya reply karo."
+    )
+    bot_username = context.bot.username or "bot"
+    keyboard = [
+        [InlineKeyboardButton("✚ ADD ME IN YOUR GROUP ✚", url=f"https://t.me/{bot_username}?startgroup=true")],
+        [InlineKeyboardButton("≋ HELP AND COMMANDS ≋", callback_data="help_menu")],
+        [
+            InlineKeyboardButton("≋ OWNER ≋", url=f"tg://user?id={OWNER_ID}"),
+            InlineKeyboardButton("≋ CHANNEL ≋", url=CHANNEL_URL or "https://t.me/"),
+        ],
+        [InlineKeyboardButton("≋ SUPPORT ≋", url=SUPPORT_URL or "https://t.me/")],
+        [InlineKeyboardButton("🧠 QUIZ", callback_data="quiz_info"), InlineKeyboardButton("🛠 AI TOOLS", callback_data="tools_info")],
+    ]
+    if START_PIC_URL:
+        await chat.send_photo(photo=START_PIC_URL, caption=welcome, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await chat.send_message(text=welcome, reply_markup=InlineKeyboardMarkup(keyboard))
 
-@app.route('/submit-review', methods=['POST'])
-def submit_review():
-    if 'user' not in session: return redirect(url_for('login'))
-    db.reviews.insert_one({
-        "user_name": session['user']['name'], "rating": int(request.form.get('rating')),
-        "comment": request.form.get('comment'), "date": datetime.datetime.now()
-    })
-    flash("⭐ Review Added!")
-    return redirect(url_for('home'))
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(get_help_text())
 
-@app.route('/add-project', methods=['POST'])
-def add_project():
-    if 'user' not in session or session['user']['email'] != ADMIN_EMAIL:
-        return "🚫 Access Denied!"
-    db.projects.insert_one({
-        "title": request.form.get('title'), "category": request.form.get('category'),
-        "image_url": request.form.get('image_url'), "description": request.form.get('description'),
-        "date": datetime.datetime.now()
-    })
-    flash("✅ New Project Added!")
-    return redirect(url_for('admin_panel'))
+# Callback handlers for buttons
+async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(get_help_text())
 
-@app.route('/delete-project/<id>')
-def delete_project(id):
-    if 'user' not in session or session['user']['email'] != ADMIN_EMAIL:
-        return "🚫 Access Denied!"
-    db.projects.delete_one({"_id": ObjectId(id)})
-    flash("🗑️ Project Deleted!")
-    return redirect(url_for('admin_panel'))
+async def tools_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    text = (
+        "🛠 AI Tools Available:\n\n"
+        "• /notes <topic>\n"
+        "• /explain <topic>\n"
+        "• /mcq <topic>\n"
+        "• /summary <text ya replied msg>\n"
+        "• /solve <question>\n"
+        "• /quiz <topic>\n"
+        "• /currentaffairs\n"
+    )
+    await q.message.reply_text(text)
 
-@app.route('/admin')
-def admin_panel():
-    if 'user' not in session: return redirect(url_for('login'))
-    if session['user']['email'] != ADMIN_EMAIL:
-        return f"🚫 Access Denied!"
-    queries = list(db.queries.find().sort("date", -1))
-    projects = list(db.projects.find().sort("date", -1))
-    return render_template('admin.html', queries=queries, projects=projects, user=session['user'])
+async def quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    text = (
+        "🧠 Quiz Mode:\n\n"
+        "Command: /quiz <topic>\n"
+        "Example:\n"
+        "• /quiz Class 10 Physics\n"
+        "• /quiz Python basics\n"
+        "Bot 5 questions + answer key dega."
+                     )
+    await q.message.reply_text(text)
 
-if __name__ == '__main__':
-    # PORT 5001 hi rakha hai
-    app.run(host='0.0.0.0', port=5001, debug=True)
+# Study commands (all async)
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    topic = " ".join(context.args).strip()
+    if not topic:
+        return await update.message.reply_text("Usage: /notes <topic>")
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Topic: {topic}\nCreate short, structured notes for a student.", mode="notes")
+    await update.message.reply_text(reply)
+
+async def explain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    topic = " ".join(context.args).strip()
+    if not topic:
+        return await update.message.reply_text("Usage: /explain <topic>")
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Explain for a student: {topic}", mode="explain")
+    await update.message.reply_text(reply)
+
+async def mcq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    topic = " ".join(context.args).strip()
+    if not topic:
+        return await update.message.reply_text("Usage: /mcq <topic>")
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Make 5 MCQs for: {topic}", mode="mcq")
+    await update.message.reply_text(reply)
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    text = " ".join(context.args).strip()
+    if not text and update.message.reply_to_message:
+        text = update.message.reply_to_message.text
+    if not text:
+        return await update.message.reply_text("Usage: /summary <text> (or reply to a message with /summary)")
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Summarize this: {text}", mode="summary")
+    await update.message.reply_text(reply)
+
+async def solve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    question = " ".join(context.args).strip()
+    if not question:
+        return await update.message.reply_text("Usage: /solve <math or logic question>")
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Solve step-by-step: {question}", mode="solve")
+    await update.message.reply_text(reply)
+
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    topic = " ".join(context.args).strip() or "general knowledge"
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(f"Create a 5-question quiz: {topic}", mode="quiz")
+    await update.message.reply_text(reply)
+
+async def current_affairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; user = update.effective_user
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+    remaining = check_spam(user.id, context)
+    if remaining > 0:
+        return await update.message.reply_text(f"Thoda dheere pucho, {int(remaining)} sec baad try karo.")
+    await chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai("Create practice-style current affairs Q&A.", mode="current")
+    await update.message.reply_text(reply)
+
+# ----------------- OWNER COMMANDS -----------------
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        users_count = await db.users.count_documents({})
+        groups_count = await db.groups.count_documents({})
+        await update.message.reply_text(f"📊 Bot Stats:\n• Total private users: {users_count}\n• Total groups: {groups_count}")
+    except Exception as e:
+        logger.error("Stats failed: %s", e)
+        await update.message.reply_text("DB error while fetching stats.")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    text = " ".join(context.args).strip()
+    if not text and update.message.reply_to_message:
+        text = update.message.reply_to_message.text
+    if not text:
+        return await update.message.reply_text("Usage: /broadcast <message> (or reply to a message and /broadcast)")
+    sent = 0; failed = 0
+    try:
+        cursor = db.users.find({}, {"user_id": 1})
+        async for u in cursor:
+            uid = u.get("user_id")
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                sent += 1
+                await asyncio.sleep(0.03)
+            except Exception:
+                failed += 1
+        await update.message.reply_text(f"Broadcast complete. Sent: {sent}, Failed: {failed}")
+    except Exception as e:
+        logger.error("Broadcast error: %s", e)
+        await update.message.reply_text("DB error during broadcast.")
+
+# ----------------- MESSAGE HANDLER -----------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text:
+        return
+    text = message.text.strip()
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # Register chat
+    await register_chat(chat.id, chat.type, context, user_obj=user)
+
+    # Group logic: only respond if mention or reply to bot
+    if chat.type in ("group", "supergroup"):
+        bot_username = context.bot.username or ""
+        mentioned = bot_username and f"@{bot_username.lower()}" in text.lower()
+        reply_to_bot = (
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (mentioned or reply_to_bot):
+            return
+        if mentioned and text.lower().strip() in {f"@{bot_username.lower()}", f"/ai@{bot_username.lower()}"}:
+            await message.reply_text("Mujhe mention ke saath apna question bhi likho. 🙂")
+            return
+
+    # Rate limit
+    if user:
+        left = check_spam(user.id, context)
+        if left > 0:
+            return await message.reply_text(f"Thoda dheere pucho, {int(left)} sec baad try karo.")
+
+    await message.chat.send_action(ChatAction.TYPING)
+    reply = await ask_ai(text, mode="default")
+    await message.reply_text(reply)
+
+# ----------------- ERROR HANDLER -----------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Exception while handling update: %s", context.error)
+
+# ----------------- Graceful shutdown helper -----------------
+def _setup_signal_handlers(app):
+    loop = asyncio.get_event_loop()
+    for sig in (SIGTERM, SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(app.shutdown()))
+        except Exception:
+            pass
+
+# ----------------- MAIN -----------------
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # attach DB reference (handlers will use global db but keep in bot_data too)
+    app.bot_data["db"] = db
+
+    # Register handlers (after functions defined)
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+
+    app.add_handler(CommandHandler("notes", notes_command))
+    app.add_handler(CommandHandler("explain", explain_command))
+    app.add_handler(CommandHandler("mcq", mcq_command))
+    app.add_handler(CommandHandler("summary", summary_command))
+    app.add_handler(CommandHandler("solve", solve_command))
+    app.add_handler(CommandHandler("quiz", quiz_command))
+    app.add_handler(CommandHandler("currentaffairs", current_affairs_command))
+
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+
+    app.add_handler(CallbackQueryHandler(help_button, pattern="^help_menu$"))
+    app.add_handler(CallbackQueryHandler(tools_button, pattern="^tools_info$"))
+    app.add_handler(CallbackQueryHandler(quiz_button, pattern="^quiz_info$"))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.add_error_handler(error_handler)
+
+    # schedule index creation in background (non-blocking)
+    try:
+        app.create_task(create_indexes(app))
+    except Exception:
+        # older PTB versions may not have create_task; safe to ignore
+        pass
+
+    logger.info("BOT STARTING...")
+
+    # ---- Critical Heroku fix: ensure an event loop exists in MainThread ----
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    _setup_signal_handlers(app)
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
